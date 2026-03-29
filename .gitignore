@@ -1,0 +1,13 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments and installers
+miniconda.sh
+.env
+venv/
+env/
+*.png
+# OS generated files
+.DS_Store

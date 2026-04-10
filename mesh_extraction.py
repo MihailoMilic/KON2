@@ -1,10 +1,14 @@
 import cv2
 from matplotlib import contour
 from matplotlib.patches import Polygon
+from networkx import radius
+from simplification.cutil import simplify_coords_vw
+from sklearn.cluster import DBSCAN
 import numpy as np
 from collections import defaultdict
 from scipy.spatial.distance import cdist
 from skimage import img_as_ubyte, measure, morphology
+from skimage.feature import corner_harris, corner_peaks
 from skimage.measure import approximate_polygon, find_contours, regionprops
 from skimage import color
 from shapely.geometry import Polygon
@@ -26,7 +30,7 @@ def extract_face_masks(img, min_face_size=500, dilation_radius=1):
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     img_eq = clahe.apply(gray)
 
-    edge_mask = cv2.Canny(img_eq, threshold1=60, threshold2=120)
+    edge_mask = cv2.Canny(img_eq, threshold1=75, threshold2=120)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     closed = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel)
@@ -50,82 +54,160 @@ def extract_face_masks(img, min_face_size=500, dilation_radius=1):
         i for i in range(1, labeled_clean.max() + 1)
         if (labeled_clean == i).sum() > min_face_size
     ]
-
     face_pixels = {i: np.argwhere(labeled_clean == i) for i in valid_labels}
 
     return labeled_clean, valid_labels, face_pixels
+def refine_faces(img, labeled_low, valid_low, face_pixels_low, min_face_size=500):
+    gray = (color.rgb2gray(img) * 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    img_eq = clahe.apply(gray)
 
-from shapely.geometry import Polygon as ShapelyPolygon
+    edge_mask = cv2.Canny(img_eq, 300, 400, apertureSize=3, L2gradient=True)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    closed = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel)
+    skeleton = morphology.skeletonize(closed > 0)
 
-def extract_face_corners(labeled_clean, face_pixels, tolerance=15, small_threshold=200, dilation_radius=15):
+    bright_mask = (img_eq > 220).astype(np.uint8)
+    bright_mask = cv2.dilate(bright_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    img_eq = cv2.inpaint(img_eq, bright_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+    img_eq[skeleton] = 0
+    img_eq[img_eq < 150] = 0
+
+    not_black = img_eq > 0
+    not_black = morphology.remove_small_objects(not_black, min_size=200)
+    labeled_high = measure.label(not_black, connectivity=1)
+
+    # Match: for each low face, find the high face with max overlap
+    refined = np.zeros_like(labeled_low)
+    used_high = set()
+
+    for fid in valid_low:
+        mask_low = labeled_low == fid
+        overlap = labeled_high[mask_low]
+        overlap = overlap[overlap > 0]
+        if len(overlap) == 0:
+            refined[mask_low] = fid
+            continue
+
+        candidates, counts = np.unique(overlap, return_counts=True)
+        best = candidates[np.argmax(counts)]
+
+        mask_high = labeled_high == best
+
+        # Skip if high face is much larger (merged faces)
+        if mask_high.sum() > 1.6 * mask_low.sum():
+            refined[mask_low] = fid
+        else:
+            refined[mask_high] = fid
+            used_high.add(best)
+
+    valid_labels = valid_low
+    face_pixels = {i: np.argwhere(refined == i) for i in valid_labels}
+    return refined, valid_labels, face_pixels
+
+def extract_face_corners(labeled_clean, face_pixels, tolerance=4):
     face_corners = {}
-    selem = morphology.disk(dilation_radius)
-    
     for i, pixels in face_pixels.items():
         mask = (labeled_clean == i)
-        area = mask.sum()
-        
-        if area < small_threshold:
-            mask = morphology.binary_dilation(mask, selem)
-        
         contours = find_contours(mask, 0.5)
         if not contours:
             continue
+        tol = 4 if len(pixels) < 300 else 10
         contour = max(contours, key=len)
-        contour = contour.astype(np.float32)
-        approx = approximate_polygon(contour, tolerance=tolerance)
-        approx = approx.reshape(-1, 2)
-        
-        if area < small_threshold:
-            # shrink polygon back — note approx is (row, col) so flip for Shapely (x, y)
-            poly = ShapelyPolygon(approx[:, ::-1])
-            shrunk = poly.buffer(-dilation_radius, join_style=2)
-            if shrunk.is_empty or shrunk.geom_type == 'MultiPolygon':
-                # fallback: keep dilated version scaled toward centroid
-                cx, cy = np.mean(approx, axis=0)
-                equiv_r = np.sqrt(area / np.pi)
-                scale = equiv_r / (equiv_r + dilation_radius)
-                approx = (approx - [cx, cy]) * scale + [cx, cy]
-            else:
-                coords = np.array(shrunk.exterior.coords)
-                approx = coords[:, ::-1]  # back to (row, col)
-        
-        face_corners[i] = approx
+        approx = approximate_polygon(contour.astype(np.float32), tolerance=tolerance)
+        face_corners[i] = approx.reshape(-1, 2)
     return face_corners
+def filter_corners(face_corners, labeled_clean, valid_labels, radius=15):
+    filtered = {}
+    for fid in valid_labels:
+        mask = (labeled_clean == fid)
+        kept = []
+        for pt in face_corners[fid]:
+            r, c = int(pt[0]), int(pt[1])
+            rr, cc = disk((r, c), radius, shape=mask.shape)
+            circle_area = len(rr)
+            inside = mask[rr, cc].sum()
+            if inside / circle_area <= 0.5:
+                kept.append(pt)
+        filtered[fid] = np.array(kept) if kept else np.empty((0, 2))
+    return filtered
+
 def compute_adjacency(labeled_clean, valid_labels, face_pixels,
-                      shared_border_threshold=20):
+                      shared_border_threshold=30, bulbs=None, bulb_radius=4):
     n = len(valid_labels)
-    adjacency = np.zeros((n, n), dtype=bool)
+    label_to_idx = {l: a for a, l in enumerate(valid_labels)}
+    adjacency = np.zeros((n, n), dtype=int)
     face_centroids = {i: pixels.mean(axis=0) for i, pixels in face_pixels.items()}
 
-    selem = morphology.disk(5)
+    selem = morphology.disk(6)
+    debug_pairs = [(23, 25), (15,25)]
 
-    background_faces = set()
-
+    # ── vectorized border counting ────────────────────────────────────────
     for a, i in enumerate(valid_labels):
         mask_i = (labeled_clean == i)
         dilated_i = morphology.binary_dilation(mask_i, selem)
         border_i = dilated_i & ~mask_i
 
         border_labels = labeled_clean[border_i]
+        labels, counts = np.unique(border_labels, return_counts=True)
+        for lbl, cnt in zip(labels, counts):
+            if lbl in label_to_idx and lbl != i:
+                b = label_to_idx[lbl]
+                adjacency[a, b] += cnt
+                # debug
+                for di, dj in debug_pairs:
+                    if i == di and lbl == dj:
+                        print(f"  Border {i}→{lbl}: {cnt} pixels")
 
-        for b, j in enumerate(valid_labels):
-            if j <= i:
-                continue
-            count = np.sum(border_labels == j)
-            if (i==17 and j ==22) or (i==22 and j==17) or (i==22 and j==31) or (i==31 and j==22):
-                print(f"Border between face {i} and {j}: {count} pixels")
-            if count > shared_border_threshold:
-                adjacency[a, b] = True
-                adjacency[b, a] = True
+    adjacency = np.maximum(adjacency, adjacency.T)
+
+    for di, dj in debug_pairs:
+        if di in label_to_idx and dj in label_to_idx:
+            a, b = label_to_idx[di], label_to_idx[dj]
+            print(f"[DEBUG] Pair {di}-{dj}: border count (symmetrized) = {adjacency[a, b]}")
+
+    # ── vectorized bulb boost ─────────────────────────────────────────────
+    if bulbs is not None and len(bulbs) > 1:
+        bulb_coords = np.round(np.array(bulbs)).astype(int)
+        bulb_area = int(np.pi * bulb_radius ** 2)
+
+        bulb_in_face = np.zeros((len(bulb_coords), n), dtype=bool)
+        for a, i in enumerate(valid_labels):
+            mask_i = (labeled_clean == i)
+            dilated_i = morphology.binary_dilation(mask_i, selem)
+            bulb_in_face[:, a] = dilated_i[bulb_coords[:, 0], bulb_coords[:, 1]]
+
+        shared_bulbs = bulb_in_face.astype(int).T @ bulb_in_face.astype(int)
+
+        for di, dj in debug_pairs:
+            if di in label_to_idx and dj in label_to_idx:
+                a, b = label_to_idx[di], label_to_idx[dj]
+                shared_count = shared_bulbs[a, b]
+                print(f"[DEBUG] Pair {di}-{dj}: shared bulbs = {shared_count}")
+                # which bulbs?
+                mask = bulb_in_face[:, a] & bulb_in_face[:, b]
+                for idx in np.where(mask)[0]:
+                    print(f"  bulb {idx} at ({bulb_coords[idx, 0]}, {bulb_coords[idx, 1]})")
+
+        boost_mask = shared_bulbs >= 2
+        adjacency += boost_mask * shared_bulbs * bulb_area
+
+        for di, dj in debug_pairs:
+            if di in label_to_idx and dj in label_to_idx:
+                a, b = label_to_idx[di], label_to_idx[dj]
+                print(f"[DEBUG] Pair {di}-{dj}: final count after boost = {adjacency[a, b]}, threshold = {shared_border_threshold}")
+
+    # ── threshold ─────────────────────────────────────────────────────────
+    adj_bool = adjacency > shared_border_threshold
+    np.fill_diagonal(adj_bool, False)
 
     adjacent_faces = {i: [] for i in valid_labels}
     for a, i in enumerate(valid_labels):
         for b, j in enumerate(valid_labels):
-            if adjacency[a, b]:
+            if adj_bool[a, b]:
                 adjacent_faces[i].append(j)
 
-    return adjacency, adjacent_faces, face_centroids
+    return adj_bool, adjacent_faces, face_centroids
 def merge_vertices(face_corners, valid_labels, adjacency, merges_per_pair=2):
     """
     For each adjacent face pair, merge the closest corner pairs using Union-Find.
@@ -214,6 +296,7 @@ def merge_vertices(face_corners, valid_labels, adjacency, merges_per_pair=2):
         face_vertices[i] = vids
 
     return vertices, face_vertices, all_pts, face_pt_indices
+
 def detect_bulb_corners(img, brightness_thresh=240, min_size=5, max_size=200):
     gray = color.rgb2gray(img)
     bright = gray > (brightness_thresh / 255.0)
@@ -224,111 +307,120 @@ def detect_bulb_corners(img, brightness_thresh=240, min_size=5, max_size=200):
             corners.append(region.centroid)  # (row, col)
     return np.array(corners)
 
-def fill_bulb_gaps(labeled_clean, bulb_corners, radius=10):
-    filled = labeled_clean.copy()
-    
-    for corner in bulb_corners:
-        r, c = int(round(corner[0])), int(round(corner[1]))
-        rr, cc = disk((r, c), radius, shape=labeled_clean.shape)
-        
-        # Only fill background pixels
-        zero_mask = filled[rr, cc] == 0
-        if not np.any(zero_mask):
-            continue
-            
-        # For each zero pixel, find nearest non-zero pixel's label
-        zero_coords = np.column_stack((rr[zero_mask], cc[zero_mask]))
-        nonzero_mask = filled[rr, cc] > 0
-        if not np.any(nonzero_mask):
-            continue
-        nonzero_coords = np.column_stack((rr[nonzero_mask], cc[nonzero_mask]))
-        nonzero_labels = filled[nonzero_coords[:, 0], nonzero_coords[:, 1]]
-        
-        dists = cdist(zero_coords, nonzero_coords)
-        nearest = dists.argmin(axis=1)
-        
-        for idx, (pr, pc) in enumerate(zero_coords):
-            filled[pr, pc] = nonzero_labels[nearest[idx]]
-    
-    return filled
+def find_all_vertices(labeled_clean, valid_labels, face_pixels, bulbs=None, D_max=12, boundary_tolerance=12):
+    """
+    Phase 1: Junction detection (topology)
+    Phase 2: Clustering
+    Phase 3: Face ring assignment
+    """
+    h, w = labeled_clean.shape
+    label_set = set(valid_labels)
+    padded = np.pad(labeled_clean, 1, mode='constant', constant_values=0)
 
-def find_dominant_direction(mask, angle_steps=180):
-    """
-    Sweep angles, project mask onto each direction, find the angle
-    where cross-section lengths have minimum variance (most uniform).
-    Returns: angle in radians, and the two edge lengths (along, across)
-    """
-    rows, cols = np.where(mask)
-    if len(rows) < 5:
-        return None, None, None
-    
-    points = np.column_stack([cols, rows]).astype(np.float64)  # (x, y)
-    best_angle = 0
-    best_score = np.inf
-    best_lengths = None
-    
-    for deg in range(0, angle_steps):
-        theta = np.radians(deg)
-        direction = np.array([np.cos(theta), np.sin(theta)])
-        perp = np.array([-np.sin(theta), np.cos(theta)])
-        
-        # project onto direction and perpendicular
-        proj_along = points @ direction
-        proj_perp = points @ perp
-        
-        # bin along the perpendicular axis — each bin is one "slice"
-        bins = np.round(proj_perp).astype(int)
-        unique_bins = np.unique(bins)
-        
-        if len(unique_bins) < 3:
+    # ── Phase 1: junction pixels ──────────────────────────────────────
+    junction_pixels = []
+    junction_labels = []
+
+    for r in range(1, h + 1):
+        for c in range(1, w + 1):
+            patch = padded[r-1:r+2, c-1:c+2]
+            labels = set(patch.flat)
+            faces = labels & label_set
+            has_bg = 0 in labels
+
+            is_junction = False
+            if len(faces) >= 3:
+                is_junction = True
+            elif len(faces) >= 2 and has_bg:
+                is_junction = True
+
+            if is_junction:
+                junction_pixels.append((r - 1, c - 1))
+                junction_labels.append(labels & (label_set | {0}))
+
+    # ── Phase 1b: boundary supplement (solo turns) ────────────────────
+    mesh_mask = (labeled_clean > 0).astype(float)
+    for contour in find_contours(mesh_mask, 0.5):
+        approx = approximate_polygon(contour, tolerance=boundary_tolerance)
+        for pt in approx:
+            pr, pc = int(round(pt[0])), int(round(pt[1]))
+            pr = np.clip(pr, 0, h - 1)
+            pc = np.clip(pc, 0, w - 1)
+            patch = padded[pr:pr+3, pc:pc+3]
+            labels = set(patch.flat) & (label_set | {0})
+            junction_pixels.append((pr, pc))
+            junction_labels.append(labels)
+
+    if not junction_pixels:
+        return [], {}, {}
+
+    # ── Phase 2: clustering ───────────────────────────────────────────
+    coords = np.array(junction_pixels)
+    from scipy.spatial.distance import pdist, squareform
+    dist = squareform(pdist(coords))
+    visited = np.zeros(len(coords), dtype=bool)
+
+    vertices = []
+    for i in range(len(coords)):
+        if visited[i]:
             continue
-        
-        # measure width of each slice
-        widths = []
-        for b in unique_bins:
-            slice_proj = proj_along[bins == b]
-            widths.append(slice_proj.max() - slice_proj.min())
-        
-        widths = np.array(widths)
-        # trim top/bottom 10% to ignore ragged edges
-        trim = max(1, len(widths) // 10)
-        widths_trimmed = np.sort(widths)[trim:-trim] if len(widths) > 2 * trim else widths
-        
-        score = np.std(widths_trimmed) / (np.mean(widths_trimmed) + 1e-6)  # CV
-        
-        if score < best_score:
-            best_score = score
-            best_angle = theta
-            best_lengths = (np.mean(widths_trimmed), len(unique_bins))
-    
-    return best_angle, best_score, best_lengths
+        group = dist[i] <= D_max
+        visited |= group
+        centroid = coords[group].mean(axis=0).astype(float)
+        merged_labels = set()
+        for j in np.where(group)[0]:
+            merged_labels |= junction_labels[j]
+        merged_labels.discard(0)
+        vertices.append({
+            'pos': centroid,
+            'faces': merged_labels,
+        })
 
+    # ── Phase 2b: integrate bulbs ─────────────────────────────────────
+    if bulbs is not None and len(bulbs) > 0:
+        vertex_coords = np.array([v['pos'] for v in vertices]) if vertices else np.empty((0, 2))
+        for br, bc in bulbs:
+            br2, bc2 = int(round(br)), int(round(bc))
+            # check if near boundary
+            pr = np.clip(br2, 1, h) 
+            pc = np.clip(bc2, 1, w)
+            patch = padded[pr-1:pr+2, pc-1:pc+2]
+            patch_labels = set(patch.flat) & label_set
 
-def polygon_from_direction(mask, angle, area):
-    """
-    Given dominant angle, build a rectangle from the bounding box 
-    in that rotated frame.
-    """
-    rows, cols = np.where(mask)
-    points = np.column_stack([cols, rows]).astype(np.float64)
-    
-    direction = np.array([np.cos(angle), np.sin(angle)])
-    perp = np.array([-np.sin(angle), np.cos(angle)])
-    
-    proj_along = points @ direction
-    proj_perp = points @ perp
-    
-    # oriented bounding box
-    a_min, a_max = proj_along.min(), proj_along.max()
-    p_min, p_max = proj_perp.min(), proj_perp.max()
-    
-    # 4 corners in original coords
-    corners = np.array([
-        direction * a_min + perp * p_min,
-        direction * a_max + perp * p_min,
-        direction * a_max + perp * p_max,
-        direction * a_min + perp * p_max,
-    ])
-    
-    # back to (row, col)
-    return corners[:, ::-1]
+            if len(vertex_coords) > 0:
+                dists = np.linalg.norm(vertex_coords - [br2, bc2], axis=1)
+                nearest = np.argmin(dists)
+                if dists[nearest] <= D_max:
+                    # merge into existing vertex
+                    v = vertices[nearest]
+                    v['pos'] = (v['pos'] + np.array([br2, bc2])) / 2
+                    v['faces'] |= patch_labels
+                    continue
+
+            # new vertex from bulb
+            vertices.append({
+                'pos': np.array([br2, bc2], dtype=float),
+                'faces': patch_labels,
+            })
+            vertex_coords = np.array([v['pos'] for v in vertices])
+
+    # ── Phase 3: face ring assignment ─────────────────────────────────
+    face_centroids = {i: pixels.mean(axis=0) for i, pixels in face_pixels.items()}
+    face_vertices = {i: [] for i in valid_labels}
+
+    for vid, v in enumerate(vertices):
+        for fid in v['faces']:
+            if fid in face_vertices:
+                face_vertices[fid].append(vid)
+
+    # angular sort per face
+    for fid, vids in face_vertices.items():
+        if len(vids) < 2:
+            continue
+        cr, cc = face_centroids[fid]
+        positions = np.array([vertices[vid]['pos'] for vid in vids])
+        angles = np.arctan2(positions[:, 0] - cr, positions[:, 1] - cc)
+        order = np.argsort(angles)
+        face_vertices[fid] = [vids[o] for o in order]
+
+    return vertices, face_vertices, face_centroids

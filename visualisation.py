@@ -29,9 +29,7 @@ def plot_labeled_faces_with_num(labeled_clean, save_path="labeled.png"):
             continue
         ys, xs = np.where(mask)
         cy, cx = ys.mean(), xs.mean()
-        plt.text(cx, cy, str(label_id), color='white', fontsize=7,
-                 ha='center', va='center', fontweight='bold',
-                 bbox=dict(facecolor='black', alpha=0.5, pad=1, edgecolor='none'))
+        plt.text(cx, cy, str(label_id), color='white', fontsize=4)
 
     plt.title(f"Labeled regions: {labeled_clean.max()}")
     plt.tight_layout()

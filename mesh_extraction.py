@@ -97,12 +97,44 @@ def refine_faces(img, labeled_low, valid_low, face_pixels_low, min_face_size=500
         # Skip if high face is much larger (merged faces)
         if mask_high.sum() > 1.6 * mask_low.sum():
             refined[mask_low] = fid
-        else:
-            refined[mask_high] = fid
-            used_high.add(best)
+            continue
 
-    valid_labels = valid_low
-    face_pixels = {i: np.argwhere(refined == i) for i in valid_labels}
+        # Skip if the high region substantially reaches into a
+        # *different* low face. Without this guard, two distinct low
+        # faces that happen to map to the same merged high region
+        # would both paint that high region, and the later face would
+        # overwrite the earlier one and absorb its pixels (Frankenstein
+        # face). The 1.6x size guard above doesn't catch this when the
+        # high region is only slightly larger than one of the two low
+        # faces it spans.
+        low_in_high = labeled_low[mask_high]
+        low_in_high = low_in_high[low_in_high > 0]
+        foreign_px = int((low_in_high != fid).sum())
+        if foreign_px > 0.2 * mask_high.sum():
+            refined[mask_low] = fid
+            continue
+
+        # Also respect previously used high regions, so two low faces
+        # can't claim the same best-high.
+        if best in used_high:
+            refined[mask_low] = fid
+            continue
+
+        refined[mask_high] = fid
+        used_high.add(best)
+
+    # Refinement can overwrite one low-res face with another when two
+    # faces claim the same high-res region. Drop any face whose refined
+    # mask ends up empty so downstream code (extract_face_corners,
+    # filter_corners, merge_vertices) never sees a phantom label.
+    face_pixels = {}
+    valid_labels = []
+    for i in valid_low:
+        pix = np.argwhere(refined == i)
+        if len(pix) == 0:
+            continue
+        face_pixels[i] = pix
+        valid_labels.append(i)
     return refined, valid_labels, face_pixels
 
 def extract_face_corners(labeled_clean, face_pixels, tolerance=4):
@@ -207,95 +239,338 @@ def compute_adjacency(labeled_clean, valid_labels, face_pixels,
             if adj_bool[a, b]:
                 adjacent_faces[i].append(j)
 
-    return adj_bool, adjacent_faces, face_centroids
-def merge_vertices(face_corners, valid_labels, adjacency, merges_per_pair=2):
-    """
-    For each adjacent face pair, merge the closest corner pairs using Union-Find.
-    Each shared edge contributes 2 shared vertices.
+    return adj_bool, adjacent_faces, face_centroids, adjacency
 
-    Returns:
-        vertices:        dict {vertex_id: [row, col] averaged position}
-        face_vertices:   dict {face_id: [list of vertex_ids]}
-        all_pts:         flat array of all corner points
-        face_pt_indices: dict {face_id: [indices into all_pts]}
+import numpy as np
+import networkx as nx
+from collections import defaultdict
+
+def merge_vertices(face_corners, valid_labels, adjacency, face_pixels,
+                               bulbs=None, dilation_radius=15):
     """
-    # Build flat list of all corner points
+    Merges corners into vertices by finding the spatial intersection
+    of morphologically dilated face masks for every topological cycle.
+
+    Each cycle (size <= 6) with at least one candidate corner produces
+    exactly one vertex. Cycles with no candidates are skipped. Corners
+    not absorbed into any junction stay as their own vertices.
+
+    If `bulbs` (true-corner coordinates) are provided, any bulb that
+    lies inside a cycle's intersection mask wins and becomes the cycle's
+    vertex. If multiple bulbs lie inside, the one closest to the
+    centroid of the intersection region is chosen.
+    """
+    # 1. Global corner pool
     all_pts = []
     face_pt_indices = {}
-    idx = 0
-    for i, corners in face_corners.items():
-        face_pt_indices[i] = []
-        for pt in corners:
-            all_pts.append(pt)
-            face_pt_indices[i].append(idx)
-            idx += 1
+    pt_to_face = {}
+    curr_idx = 0
+    for fid in valid_labels:
+        corners = face_corners.get(fid, np.empty((0, 2)))
+        face_pt_indices[fid] = np.arange(curr_idx, curr_idx + len(corners))
+        for k in range(len(corners)):
+            pt_to_face[curr_idx + k] = fid
+        all_pts.extend(corners)
+        curr_idx += len(corners)
     all_pts = np.array(all_pts)
 
-    # Union-Find
-    parent = list(range(len(all_pts)))
+    # 2. Build dilated mask per face using morphology.disk
+    max_r = max(int(p[:, 0].max()) for p in face_pixels.values() if len(p) > 0)
+    max_c = max(int(p[:, 1].max()) for p in face_pixels.values() if len(p) > 0)
+    H = max_r + dilation_radius + 2
+    W = max_c + dilation_radius + 2
+    selem = morphology.disk(dilation_radius)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+    dilated_masks = {}
+    for fid in valid_labels:
+        mask = np.zeros((H, W), dtype=bool)
+        pix = face_pixels[fid]
+        mask[pix[:, 0], pix[:, 1]] = True
+        dilated_masks[fid] = morphology.binary_dilation(mask, selem)
 
-    def union(x, y):
-        parent[find(x)] = find(y)
+    # 3. Bulb array (in row, col)
+    if bulbs is not None and len(bulbs) > 0:
+        bulb_arr = np.asarray(bulbs, dtype=float)
+    else:
+        bulb_arr = np.empty((0, 2))
 
-    # Merge closest pairs per adjacent face pair
+    # 4. Adjacency graph
+    G = nx.Graph()
     for a, i in enumerate(valid_labels):
         for b, j in enumerate(valid_labels):
-            if not adjacency[a, b] or j <= i:
-                continue
+            if adjacency[a, b] and j > i:
+                G.add_edge(i, j)
 
-            i_indices = face_pt_indices[i]
-            j_indices = face_pt_indices[j]
+    # 5. Cycles
+    cycles = nx.minimum_cycle_basis(G)
 
-            pairs = sorted([
-                (np.linalg.norm(all_pts[pi] - all_pts[pj]), pi, pj)
-                for pi in i_indices
-                for pj in j_indices
-            ])
-
-            used_i, used_j = set(), set()
-            merged = 0
-            for dist, pi, pj in pairs:
-                if pi in used_i or pj in used_j:
-                    continue
-                union(pi, pj)
-                used_i.add(pi)
-                used_j.add(pj)
-                merged += 1
-                if merged == merges_per_pair:
-                    break
-
-    # Group points by their root
-    groups = defaultdict(list)
-    for i in range(len(all_pts)):
-        groups[find(i)].append(i)
-
-    # Average positions within each group
+    # 6. Per-cycle junction vertex
     vertices = {}
     pt_to_vertex = {}
-    vertex_id = 1
-    for root, members in groups.items():
-        vertices[vertex_id] = all_pts[members].mean(axis=0)
-        for m in members:
-            pt_to_vertex[m] = vertex_id
-        vertex_id += 1
+    face_extra_vids = defaultdict(list)
+    used_bulbs = set()  # bulb indices already materialized as a vertex
+    next_vid = 1
 
-    # Remap face corners to vertex IDs, deduplicating within each face
+    for cycle in cycles:
+        if len(cycle) > 6:
+            continue
+
+        relevant_indices = np.concatenate([face_pt_indices[fid] for fid in cycle])
+        if len(relevant_indices) == 0:
+            continue
+
+        # Intersection of dilated masks for every face in this cycle
+        inter = dilated_masks[cycle[0]].copy()
+        for fid in cycle[1:]:
+            inter &= dilated_masks[fid]
+        if not inter.any():
+            continue
+
+        # ── Try bulb-based vertex first ───────────────────────────────
+        # A bulb lies in the cycle's junction zone iff it falls inside
+        # the intersection mask. If multiple do, pick the one nearest
+        # to the centroid of the intersection region.
+        vertex_pos = None
+        vertex_from_bulb = False
+        if len(bulb_arr) > 0:
+            bulb_rc = np.round(bulb_arr).astype(int)
+            in_bounds = (
+                (bulb_rc[:, 0] >= 0) & (bulb_rc[:, 0] < H) &
+                (bulb_rc[:, 1] >= 0) & (bulb_rc[:, 1] < W)
+            )
+            inside = np.zeros(len(bulb_arr), dtype=bool)
+            inside[in_bounds] = inter[bulb_rc[in_bounds, 0],
+                                      bulb_rc[in_bounds, 1]]
+            hits = np.where(inside)[0]
+            if len(hits) == 1:
+                vertex_pos = bulb_arr[hits[0]]
+                vertex_from_bulb = True
+                used_bulbs.add(int(hits[0]))
+            elif len(hits) > 1:
+                inter_rows, inter_cols = np.where(inter)
+                centroid = np.array([inter_rows.mean(), inter_cols.mean()])
+                d = np.linalg.norm(bulb_arr[hits] - centroid, axis=1)
+                chosen = int(hits[np.argmin(d)])
+                vertex_pos = bulb_arr[chosen]
+                vertex_from_bulb = True
+                used_bulbs.add(chosen)
+
+        # ── Fallback: average of intersection-zone corners ────────────
+        if vertex_pos is None:
+            corner_in_inter = []
+            for idx in relevant_indices:
+                idx = int(idx)
+                r, c = all_pts[idx]
+                ri, ci2 = int(round(r)), int(round(c))
+                if 0 <= ri < H and 0 <= ci2 < W and inter[ri, ci2]:
+                    corner_in_inter.append(idx)
+            if not corner_in_inter:
+                continue
+            vertex_pos = all_pts[corner_in_inter].mean(axis=0)
+
+        # Claim every unclaimed corner of a cycle face that belongs to
+        # this junction. Always claim corners that lie inside the
+        # intersection mask. When the vertex was pinned to a bulb (a
+        # ground-truth corner location), additionally absorb any
+        # straggler corner within `dilation_radius` of the bulb, so that
+        # duplicate polygon-approximation corners don't survive as
+        # singleton vertices visually near the junction.
+        winners = []
+        for idx in relevant_indices:
+            idx = int(idx)
+            if idx in pt_to_vertex:
+                continue
+            r, c = all_pts[idx]
+            ri, ci2 = int(round(r)), int(round(c))
+            in_inter = 0 <= ri < H and 0 <= ci2 < W and inter[ri, ci2]
+            near_bulb = (
+                vertex_from_bulb
+                and np.linalg.norm(all_pts[idx] - vertex_pos) <= dilation_radius
+            )
+            if in_inter or near_bulb:
+                winners.append(idx)
+
+        vertices[next_vid] = vertex_pos
+        for idx in winners:
+            pt_to_vertex[idx] = next_vid
+
+        winner_faces = {pt_to_face[idx] for idx in winners}
+        for fid in cycle:
+            if fid not in winner_faces:
+                face_extra_vids[fid].append(next_vid)
+
+        next_vid += 1
+
+    # 7. Boundary-edge pass: adjacent face pairs (u, v) that weren't
+    # fully covered by cycles. The intersection of their dilated masks
+    # is a strip along the shared edge; the two endpoints of that edge
+    # are the vertices we want to produce here.
+    def _corner_in_mask(idx, mask):
+        r, c = all_pts[idx]
+        ri, ci = int(round(r)), int(round(c))
+        return 0 <= ri < H and 0 <= ci < W and mask[ri, ci]
+
+    for u, v in G.edges():
+        inter_uv = dilated_masks[u] & dilated_masks[v]
+        if not inter_uv.any():
+            continue
+
+        cand_u = [int(idx) for idx in face_pt_indices[u]
+                  if int(idx) not in pt_to_vertex
+                  and _corner_in_mask(int(idx), inter_uv)]
+        cand_v = [int(idx) for idx in face_pt_indices[v]
+                  if int(idx) not in pt_to_vertex
+                  and _corner_in_mask(int(idx), inter_uv)]
+        if not cand_u and not cand_v:
+            continue
+
+        # ── Bulb-assisted merges first ────────────────────────────────
+        if len(bulb_arr) > 0:
+            bulb_rc = np.round(bulb_arr).astype(int)
+            in_bounds = (
+                (bulb_rc[:, 0] >= 0) & (bulb_rc[:, 0] < H) &
+                (bulb_rc[:, 1] >= 0) & (bulb_rc[:, 1] < W)
+            )
+            inside = np.zeros(len(bulb_arr), dtype=bool)
+            inside[in_bounds] = inter_uv[bulb_rc[in_bounds, 0],
+                                         bulb_rc[in_bounds, 1]]
+            for bi in np.where(inside)[0]:
+                bulb_pos = bulb_arr[bi]
+                near_u = [idx for idx in cand_u
+                          if np.linalg.norm(all_pts[idx] - bulb_pos) <= dilation_radius]
+                near_v = [idx for idx in cand_v
+                          if np.linalg.norm(all_pts[idx] - bulb_pos) <= dilation_radius]
+                if not near_u and not near_v:
+                    continue
+                vertices[next_vid] = bulb_pos
+                for idx in near_u + near_v:
+                    pt_to_vertex[idx] = next_vid
+                used_bulbs.add(int(bi))
+                next_vid += 1
+                cand_u = [idx for idx in cand_u if idx not in pt_to_vertex]
+                cand_v = [idx for idx in cand_v if idx not in pt_to_vertex]
+
+        # ── Greedy pairwise match of leftover u/v corners ────────────
+        # After creating a vertex, sweep leftover candidates and absorb
+        # any that sit within dilation_radius of the new vertex — handles
+        # the common case where polygon approximation emits duplicate
+        # corners at the same (r, c) on the same face.
+        while cand_u and cand_v:
+            d_mat = np.linalg.norm(
+                all_pts[cand_u][:, None] - all_pts[cand_v][None, :],
+                axis=2,
+            )
+            flat_idx = int(np.argmin(d_mat))
+            i, j = divmod(flat_idx, d_mat.shape[1])
+            if d_mat[i, j] > 2 * dilation_radius:
+                break
+            ui, vi = cand_u[i], cand_v[j]
+            midpoint = (all_pts[ui] + all_pts[vi]) / 2.0
+            vertices[next_vid] = midpoint
+            pt_to_vertex[ui] = next_vid
+            pt_to_vertex[vi] = next_vid
+
+            # Absorb leftover candidates (from either side) within
+            # dilation_radius of the new vertex position.
+            new_cand_u = []
+            for idx in cand_u:
+                if idx == ui:
+                    continue
+                if np.linalg.norm(all_pts[idx] - midpoint) <= dilation_radius:
+                    pt_to_vertex[idx] = next_vid
+                else:
+                    new_cand_u.append(idx)
+            new_cand_v = []
+            for idx in cand_v:
+                if idx == vi:
+                    continue
+                if np.linalg.norm(all_pts[idx] - midpoint) <= dilation_radius:
+                    pt_to_vertex[idx] = next_vid
+                else:
+                    new_cand_v.append(idx)
+            cand_u, cand_v = new_cand_u, new_cand_v
+            next_vid += 1
+
+    # 7b. Isolated-bulb sweep. Any bulb not yet materialized as a
+    # vertex still represents a true corner. For each such bulb, find
+    # every face whose dilation contains it, absorb that face's
+    # unclaimed corners within `dilation_radius`, and create a vertex
+    # pinned to the bulb. Bulbs with no nearby unclaimed corner become
+    # dangling vertices only if at least one face's dilation still
+    # contains them (otherwise they're noise and ignored).
+    if len(bulb_arr) > 0:
+        bulb_rc = np.round(bulb_arr).astype(int)
+        for bi in range(len(bulb_arr)):
+            if bi in used_bulbs:
+                continue
+            br, bc = bulb_rc[bi]
+            if not (0 <= br < H and 0 <= bc < W):
+                continue
+            faces_here = [fid for fid in valid_labels
+                          if dilated_masks[fid][br, bc]]
+            if not faces_here:
+                continue
+            bulb_pos = bulb_arr[bi]
+            absorbed = []
+            for fid in faces_here:
+                for idx in face_pt_indices[fid]:
+                    idx = int(idx)
+                    if idx in pt_to_vertex:
+                        continue
+                    if np.linalg.norm(all_pts[idx] - bulb_pos) <= dilation_radius:
+                        absorbed.append(idx)
+            if not absorbed:
+                continue  # bulb with no supporting corner -> skip as noise
+            vertices[next_vid] = bulb_pos
+            for idx in absorbed:
+                pt_to_vertex[idx] = next_vid
+            for fid in faces_here:
+                if not any(pt_to_face[idx] == fid for idx in absorbed):
+                    face_extra_vids[fid].append(next_vid)
+            used_bulbs.add(bi)
+            next_vid += 1
+
+    # 8. Snap remaining unclaimed corners to existing vertices when
+    # close enough. This handles path-junction cases where 3 faces meet
+    # at a corner but the face adjacency graph is missing one of the
+    # three edges (e.g. 4-7-5, 8-14-30), so no 3-cycle claims the
+    # junction. The first edge pass creates a vertex from 2 of the 3
+    # faces; stray corners from the third face would otherwise become
+    # singleton duplicates at the same spot.
+    if vertices:
+        vert_ids = list(vertices.keys())
+        vert_arr = np.array([vertices[vid] for vid in vert_ids])
+        for idx in range(len(all_pts)):
+            if idx in pt_to_vertex:
+                continue
+            d = np.linalg.norm(vert_arr - all_pts[idx], axis=1)
+            j = int(np.argmin(d))
+            if d[j] <= dilation_radius:
+                pt_to_vertex[idx] = vert_ids[j]
+
+    # 9. Singleton vertices for whatever corners still remain
+    for idx in range(len(all_pts)):
+        if idx not in pt_to_vertex:
+            vertices[next_vid] = all_pts[idx]
+            pt_to_vertex[idx] = next_vid
+            next_vid += 1
+
+    # 10. Build face_vertices, preserving original corner order, dedup'd
     face_vertices = {}
-    for i, corners in face_corners.items():
-        vids = []
-        for k in range(len(corners)):
-            vid = pt_to_vertex[face_pt_indices[i][k]]
-            if vid not in vids:
-                vids.append(vid)
-        face_vertices[i] = vids
+    for fid in valid_labels:
+        seen = []
+        for idx in face_pt_indices[fid]:
+            vid = pt_to_vertex[int(idx)]
+            if vid not in seen:
+                seen.append(vid)
+        for vid in face_extra_vids[fid]:
+            if vid not in seen:
+                seen.append(vid)
+        face_vertices[fid] = seen
 
     return vertices, face_vertices, all_pts, face_pt_indices
+
+
 
 def detect_bulb_corners(img, brightness_thresh=240, min_size=5, max_size=200):
     gray = color.rgb2gray(img)
@@ -306,121 +581,3 @@ def detect_bulb_corners(img, brightness_thresh=240, min_size=5, max_size=200):
         if min_size < region.area < max_size:
             corners.append(region.centroid)  # (row, col)
     return np.array(corners)
-
-def find_all_vertices(labeled_clean, valid_labels, face_pixels, bulbs=None, D_max=12, boundary_tolerance=12):
-    """
-    Phase 1: Junction detection (topology)
-    Phase 2: Clustering
-    Phase 3: Face ring assignment
-    """
-    h, w = labeled_clean.shape
-    label_set = set(valid_labels)
-    padded = np.pad(labeled_clean, 1, mode='constant', constant_values=0)
-
-    # ── Phase 1: junction pixels ──────────────────────────────────────
-    junction_pixels = []
-    junction_labels = []
-
-    for r in range(1, h + 1):
-        for c in range(1, w + 1):
-            patch = padded[r-1:r+2, c-1:c+2]
-            labels = set(patch.flat)
-            faces = labels & label_set
-            has_bg = 0 in labels
-
-            is_junction = False
-            if len(faces) >= 3:
-                is_junction = True
-            elif len(faces) >= 2 and has_bg:
-                is_junction = True
-
-            if is_junction:
-                junction_pixels.append((r - 1, c - 1))
-                junction_labels.append(labels & (label_set | {0}))
-
-    # ── Phase 1b: boundary supplement (solo turns) ────────────────────
-    mesh_mask = (labeled_clean > 0).astype(float)
-    for contour in find_contours(mesh_mask, 0.5):
-        approx = approximate_polygon(contour, tolerance=boundary_tolerance)
-        for pt in approx:
-            pr, pc = int(round(pt[0])), int(round(pt[1]))
-            pr = np.clip(pr, 0, h - 1)
-            pc = np.clip(pc, 0, w - 1)
-            patch = padded[pr:pr+3, pc:pc+3]
-            labels = set(patch.flat) & (label_set | {0})
-            junction_pixels.append((pr, pc))
-            junction_labels.append(labels)
-
-    if not junction_pixels:
-        return [], {}, {}
-
-    # ── Phase 2: clustering ───────────────────────────────────────────
-    coords = np.array(junction_pixels)
-    from scipy.spatial.distance import pdist, squareform
-    dist = squareform(pdist(coords))
-    visited = np.zeros(len(coords), dtype=bool)
-
-    vertices = []
-    for i in range(len(coords)):
-        if visited[i]:
-            continue
-        group = dist[i] <= D_max
-        visited |= group
-        centroid = coords[group].mean(axis=0).astype(float)
-        merged_labels = set()
-        for j in np.where(group)[0]:
-            merged_labels |= junction_labels[j]
-        merged_labels.discard(0)
-        vertices.append({
-            'pos': centroid,
-            'faces': merged_labels,
-        })
-
-    # ── Phase 2b: integrate bulbs ─────────────────────────────────────
-    if bulbs is not None and len(bulbs) > 0:
-        vertex_coords = np.array([v['pos'] for v in vertices]) if vertices else np.empty((0, 2))
-        for br, bc in bulbs:
-            br2, bc2 = int(round(br)), int(round(bc))
-            # check if near boundary
-            pr = np.clip(br2, 1, h) 
-            pc = np.clip(bc2, 1, w)
-            patch = padded[pr-1:pr+2, pc-1:pc+2]
-            patch_labels = set(patch.flat) & label_set
-
-            if len(vertex_coords) > 0:
-                dists = np.linalg.norm(vertex_coords - [br2, bc2], axis=1)
-                nearest = np.argmin(dists)
-                if dists[nearest] <= D_max:
-                    # merge into existing vertex
-                    v = vertices[nearest]
-                    v['pos'] = (v['pos'] + np.array([br2, bc2])) / 2
-                    v['faces'] |= patch_labels
-                    continue
-
-            # new vertex from bulb
-            vertices.append({
-                'pos': np.array([br2, bc2], dtype=float),
-                'faces': patch_labels,
-            })
-            vertex_coords = np.array([v['pos'] for v in vertices])
-
-    # ── Phase 3: face ring assignment ─────────────────────────────────
-    face_centroids = {i: pixels.mean(axis=0) for i, pixels in face_pixels.items()}
-    face_vertices = {i: [] for i in valid_labels}
-
-    for vid, v in enumerate(vertices):
-        for fid in v['faces']:
-            if fid in face_vertices:
-                face_vertices[fid].append(vid)
-
-    # angular sort per face
-    for fid, vids in face_vertices.items():
-        if len(vids) < 2:
-            continue
-        cr, cc = face_centroids[fid]
-        positions = np.array([vertices[vid]['pos'] for vid in vids])
-        angles = np.arctan2(positions[:, 0] - cr, positions[:, 1] - cc)
-        order = np.argsort(angles)
-        face_vertices[fid] = [vids[o] for o in order]
-
-    return vertices, face_vertices, face_centroids

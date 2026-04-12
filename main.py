@@ -23,7 +23,7 @@ from visualisation import (
 )
 
 # ── Load image ────────────────────────────────────────────────────────────────
-img = io.imread("hole_081_normalised copy.jpg")
+img = io.imread("hole_081_normalised.jpg")
 # ── Stage 1: Extract face masks ───────────────────────────────────────────────
 bulbs = detect_bulb_corners(img)
 print(f"Bulbs detected: {len(bulbs)} → {bulbs}")
@@ -37,7 +37,7 @@ face_corners = filter_corners(face_corners, labeled_clean, valid_labels, radius 
 
 plot_corners(img, face_corners, face_pixels, valid_labels, save_path="corners.png")
 # ── Stage 3: Compute face adjacency ───────────────────────────────────────────
-adjacency, adjacent_faces, face_centroids = compute_adjacency(
+adjacency, adjacent_faces, face_centroids,adjacency_raw = compute_adjacency(
     labeled_clean, valid_labels, face_pixels,
    shared_border_threshold=35,
    bulbs = bulbs
@@ -47,7 +47,7 @@ plot_adjacency(img, labeled_clean, valid_labels,
 for face_id in sorted(adjacent_faces.keys()):
     print(f"Face {face_id}: {len(adjacent_faces[face_id])} neighbors → {adjacent_faces[face_id]}")
 
-vertices, face_vertices, all_pts, face_pt_indices= merge_vertices(face_corners,valid_labels,adjacency)
+vertices, face_vertices, all_pts, face_pt_indices= merge_vertices(face_corners,valid_labels,adjacency, face_pixels, bulbs=bulbs)
 plot_merged_vertices(img,
     face_corners,
     all_pts,

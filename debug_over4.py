@@ -33,7 +33,7 @@ for f in files:
                 labeled_clean, valid_labels, face_pixels,
                 shared_border_threshold=35, bulbs=bulbs)
             vertices, face_vertices, all_pts, face_pt_indices = merge_vertices(
-                face_corners, valid_labels, adjacency, face_pixels, bulbs=bulbs)
+                face_corners, valid_labels, adjacency, face_pixels, bulbs=bulbs, img=img)
     except Exception as e:
         print(f"{f}: ERROR {e}")
         continue

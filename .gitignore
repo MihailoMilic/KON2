@@ -13,3 +13,5 @@ env/
 .DS_Store
 merged/
 *.jpg
+*.nas
+*.txt

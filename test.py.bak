@@ -11,7 +11,6 @@ from mesh_extraction import (
     detect_bulb_corners,
     refine_faces,
     filter_corners,
-    filter_edge_faces
 
 )
 from visualisation import (
@@ -47,7 +46,7 @@ plot_corners(img, face_corners, face_pixels, valid_labels, save_path=f"corners.p
 # ── Stage 3: Compute face adjacency ───────────────────────────────────────────
 adjacency, adjacent_faces, face_centroids,adjacency_raw = compute_adjacency(
     labeled_clean, valid_labels, face_pixels,
-shared_border_threshold=33,
+shared_border_threshold=35,
 bulbs = bulbs
 )
 plot_adjacency(img, labeled_clean, valid_labels,
@@ -56,7 +55,6 @@ for face_id in sorted(adjacent_faces.keys()):
     print(f"Face {face_id}: {len(adjacent_faces[face_id])} neighbors → {adjacent_faces[face_id]}")
 
 vertices, face_vertices, all_pts, face_pt_indices= merge_vertices(face_corners,valid_labels,adjacency, face_pixels, bulbs=bulbs)
-vertices, face_vertices, valid_labels,face_pixels, labeled = filter_edge_faces(vertices, face_vertices, valid_labels, face_pixels, labeled_clean, img.shape, margin=200)   
 plot_merged_vertices(img,
     face_corners,
     all_pts,

@@ -123,30 +123,6 @@ def plot_merged_vertices(img, face_corners, all_pts, vertices,
                              facecolor=_face_color(idx), edgecolor='white',
                              linewidth=1, alpha=0.3))
 
-    # Original corners in blue
-    for pt in all_pts:
-        ax.scatter(pt[1], pt[0], c='blue', s=1, zorder=4)
-
-    # Merge lines in yellow
-    import numpy as np
-    for a, i in enumerate(valid_labels):
-        for b, j in enumerate(valid_labels):
-            if not adjacency[a, b] or j <= i:
-                continue
-            i_indices = face_pt_indices[i]
-            j_indices = face_pt_indices[j]
-
-            best_dist, best_i, best_j = np.inf, None, None
-            for pi in i_indices:
-                for pj in j_indices:
-                    dist = np.linalg.norm(all_pts[pi] - all_pts[pj])
-                    if dist < best_dist:
-                        best_dist, best_i, best_j = dist, pi, pj
-
-            ax.plot([all_pts[best_i][1], all_pts[best_j][1]],
-                    [all_pts[best_i][0], all_pts[best_j][0]],
-                    'y-', linewidth=1.5, zorder=5)
-
     # Final merged vertices in red
     for vid, pos in vertices.items():
         ax.scatter(pos[1], pos[0], c='red', s=2, zorder=6)

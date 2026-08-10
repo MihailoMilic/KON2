@@ -1,5 +1,5 @@
-# Aeon — Mesh Extraction Pipeline
-
+# NIO Hackethon — Mesh Extraction Pipeline 
+- Awarded 4th Place
 Converts normalised hole images (JPEG) into Nastran bulk-data mesh files (`.nas`).
 Each image is segmented into faces, corners are detected and merged into shared vertices,
 a scale reference bar converts pixel coordinates to real-world units, and a conforming

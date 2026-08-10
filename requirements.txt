@@ -1,10 +1,27 @@
+# Install with:  pip install -r requirements.txt
+
+# Image I/O and processing
 ImageIO==2.37.3
 lazy-loader==0.5
-networkx==3.4.2
-numpy==2.2.6
 opencv-python==4.13.0.92
-packaging==26.0
 pillow==12.1.1
-scikit-image==0.25.2
-scipy==1.15.3
 tifffile==2025.5.10
+
+# Numerical and scientific computing
+numpy==2.2.6
+scipy==1.15.3
+packaging==26.0
+
+# Image analysis and machine learning
+scikit-image==0.25.2
+scikit-learn==1.8.0
+
+# Geometry and mesh utilities
+shapely==2.1.2
+simplification==0.7.14
+
+# Graph algorithms (adjacency, cycle detection)
+networkx==3.4.2
+
+# Visualisation
+matplotlib==3.10.1

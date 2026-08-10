@@ -1,4 +1,4 @@
-# NIO Hackethon — Mesh Extraction Pipeline Awarded (4th Place)
+# NIO Hackethon Top 5 Rank Submission — Mesh Extraction Pipeline 
 
 Converts normalised hole images (JPEG) into Nastran bulk-data mesh files (`.nas`).
 Each image is segmented into faces, corners are detected and merged into shared vertices,
